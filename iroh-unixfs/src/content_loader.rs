@@ -12,14 +12,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cid::{multibase::Base, Cid};
 use futures::future::Either;
+use futures::StreamExt;
 use iroh_rpc_client::Client;
 use reqwest::Url;
 use tracing::{debug, info, trace, warn};
 
 use crate::{
+    builder::FileBuilder,
     indexer::{Indexer, IndexerUrl},
     parse_links,
     types::{LoadedCid, Source},
+    uploads::make_dir_from_file_list,
 };
 
 pub const IROH_STORE: &str = "iroh-store";
@@ -32,10 +35,18 @@ pub trait ContentLoader: Sync + Send + std::fmt::Debug + Clone + 'static {
     async fn stop_session(&self, ctx: ContextId) -> Result<()>;
     /// Checks if the given cid is present in the local storage.
     async fn has_cid(&self, cid: &Cid) -> Result<bool>;
-    /// Store some content
+    /// Store multiple files as a single unixFS directory
+    async fn store_files<T: tokio::io::AsyncRead + 'static + std::marker::Send>(
+        &self,
+        _entries: Vec<(T, String)>,
+    ) -> Result<cid::Cid, anyhow::Error> {
+        unimplemented!()
+    }
+
+    /// Store a single file
     async fn store_file<T: tokio::io::AsyncRead + 'static + std::marker::Send>(
         &self,
-        _content: T,
+        _file: T,
     ) -> Result<cid::Cid, anyhow::Error> {
         unimplemented!()
     }
@@ -55,11 +66,18 @@ impl<T: ContentLoader> ContentLoader for Arc<T> {
         self.as_ref().has_cid(cid).await
     }
 
+    async fn store_files<C: tokio::io::AsyncRead + 'static + std::marker::Send>(
+        &self,
+        entries: Vec<(C, String)>,
+    ) -> Result<cid::Cid, anyhow::Error> {
+        self.as_ref().store_files(entries).await
+    }
+
     async fn store_file<C: tokio::io::AsyncRead + 'static + std::marker::Send>(
         &self,
-        content: C,
+        file: C,
     ) -> Result<cid::Cid, anyhow::Error> {
-        self.as_ref().store_file(content).await
+        self.as_ref().store_file(file).await
     }
 }
 
@@ -281,13 +299,11 @@ impl ContentLoader for FullLoader {
         self.client.try_store()?.has(*cid).await
     }
 
+    // Store a single file and returns the root cid for the stored content.
     async fn store_file<T: tokio::io::AsyncRead + 'static + std::marker::Send>(
         &self,
         content: T,
     ) -> Result<cid::Cid, anyhow::Error> {
-        use crate::builder::FileBuilder;
-        use futures::StreamExt;
-
         let store = self.client.try_store()?;
 
         let file_builder = FileBuilder::new()
@@ -297,6 +313,34 @@ impl ContentLoader for FullLoader {
 
         let mut cids: Vec<cid::Cid> = vec![];
         let mut blocks = Box::pin(file.encode().await?);
+        while let Some(block) = blocks.next().await {
+            let (cid, bytes, links) = block.unwrap().into_parts();
+            cids.push(cid);
+            store.put(cid, bytes, links).await?;
+        }
+
+        match cids.last() {
+            Some(root_cid) => {
+                // This fails if Kademlia is not enabled, which can be the case
+                // and it's ok.
+                let _ = self.client.try_p2p()?.start_providing(&root_cid).await;
+                Ok(*root_cid)
+            }
+            None => Err(anyhow!("no root cid!")),
+        }
+    }
+
+    // Store a set of file and returns the root cid for the stored content.
+    async fn store_files<T: tokio::io::AsyncRead + 'static + std::marker::Send>(
+        &self,
+        entries: Vec<(T, String)>,
+    ) -> Result<cid::Cid, anyhow::Error> {
+        let store = self.client.try_store()?;
+        let mut cids: Vec<cid::Cid> = vec![];
+
+        let directory = make_dir_from_file_list(entries).await?;
+
+        let mut blocks = directory.encode();
         while let Some(block) = blocks.next().await {
             let (cid, bytes, links) = block.unwrap().into_parts();
             cids.push(cid);

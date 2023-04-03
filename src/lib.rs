@@ -120,7 +120,7 @@ mod tests {
         let expect_name = filename.to_string();
 
         let (db, hash) =
-            provider::create_collection(vec![provider::DataSource::File(path)]).await?;
+            provider::create_collection(vec![provider::DataSource::File((path, None))]).await?;
         let provider = provider::Provider::builder(db).bind_addr(addr).spawn()?;
 
         async fn run_client(
@@ -217,7 +217,7 @@ mod tests {
             let hash = Hash::from(hash);
 
             tokio::fs::write(&path, data).await?;
-            files.push(provider::DataSource::File(path.clone()));
+            files.push(provider::DataSource::File((path.clone(), None)));
 
             // keep track of expected values
             expects.push((name, path, hash));

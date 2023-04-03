@@ -443,6 +443,14 @@ impl Provider {
     pub fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
     }
+
+    /// Add data sources to this provider
+    pub async fn add_sources(&self, data_sources: Vec<DataSource>) -> Result<Hash> {
+        let (db, hash) = create_collection_inner(data_sources, Progress::none()).await?;
+
+        self.inner.db.union_with(db);
+        Ok(hash)
+    }
 }
 
 /// The future completes when the spawned tokio task finishes.
